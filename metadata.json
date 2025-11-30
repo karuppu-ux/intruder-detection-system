@@ -1,0 +1,7 @@
+{
+  "name": "IntruderNet",
+  "description": "AI-Powered Security System Dashboard and Guide. Simulates YOLO11-Pose and LSTM based intrusion detection.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
