@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Camera, RefreshCw, AlertTriangle, Video, Lock, Play, Pause, Square, Cuboid, Globe, Scan, EyeOff, MousePointer2, Flame, Maximize2, Minimize2, Radio } from 'lucide-react';
 import { SecurityStatus, ZoneRect } from '../types';
+import { ACTION_THRESHOLDS } from '../constants';
 
 interface VideoFeedProps {
   status: SecurityStatus;
@@ -108,6 +109,9 @@ export const VideoFeed: React.FC<VideoFeedProps> = ({
   const onDetectionUpdateRef = useRef(onDetectionUpdate);
   const lastSnapshotTimeRef = useRef(0);
   
+  // Previous frame landmarks for velocity calculation
+  const prevLandmarksRef = useRef<any>(null);
+
   const zoneRectRef = useRef(zoneRect);
   const privacyModeRef = useRef(privacyMode);
   const confidenceRef = useRef(confidenceThreshold);
@@ -453,6 +457,7 @@ export const VideoFeed: React.FC<VideoFeedProps> = ({
         if (ctx3d) ctx3d.clearRect(0, 0, canvas3DRef.current.width, canvas3DRef.current.height);
     }
 
+    // Zone Drawing
     if (currentZone) {
         ctx.strokeStyle = '#ef4444';
         ctx.lineWidth = 2;
@@ -471,6 +476,7 @@ export const VideoFeed: React.FC<VideoFeedProps> = ({
       const visibilityScore = landmarks.reduce((acc: number, curr: any) => acc + curr.visibility, 0) / 33;
 
       if (visibilityScore >= minConf) {
+          // Privacy Blur
           if (currentPrivacy) {
               const nose = landmarks[0];
               const leftEye = landmarks[2];
@@ -505,107 +511,140 @@ export const VideoFeed: React.FC<VideoFeedProps> = ({
           const rightHip = landmarks[24];
           const leftWrist = landmarks[15];
           const rightWrist = landmarks[16];
+          const leftKnee = landmarks[25];
+          const rightKnee = landmarks[26];
 
-          let actionScore = 0; 
-          
+          // --- ACTION ENGINE ---
+          let currentAction = 'normal';
+          const sensFactor = sens / 5; // 1.0 is default sensitivity
+
+          // Calculate Velocities if previous frame exists
+          let velocityScore = 0;
+          if (prevLandmarksRef.current) {
+              const prevWristL = prevLandmarksRef.current[15];
+              const prevWristR = prevLandmarksRef.current[16];
+              
+              if (leftWrist && rightWrist && prevWristL && prevWristR) {
+                  const distL = Math.sqrt(Math.pow(leftWrist.x - prevWristL.x, 2) + Math.pow(leftWrist.y - prevWristL.y, 2));
+                  const distR = Math.sqrt(Math.pow(rightWrist.x - prevWristR.x, 2) + Math.pow(rightWrist.y - prevWristR.y, 2));
+                  
+                  // High velocity on wrists usually indicates fighting, waving, or aggressive action
+                  if (distL > ACTION_THRESHOLDS.FIGHTING_VELOCITY * sensFactor || distR > ACTION_THRESHOLDS.FIGHTING_VELOCITY * sensFactor) {
+                      velocityScore += 2;
+                  }
+              }
+          }
+          prevLandmarksRef.current = landmarks;
+
+          // Heuristic Logic
           if (leftShoulder && rightShoulder && leftHip && rightHip) {
             
-            const xValues = landmarks.map((l: any) => l.x);
-            const yValues = landmarks.map((l: any) => l.y);
-            const minX = Math.min(...xValues) * width;
-            const maxX = Math.max(...xValues) * width;
-            const minY = Math.min(...yValues) * height;
-            const maxY = Math.max(...yValues) * height;
-            const centerX = minX + (maxX - minX) / 2;
-            const centerY = minY + (maxY - minY) / 2;
-
-            let isInsideZone = true;
-            if (currentZone) {
-                if (centerX < currentZone.x || centerX > currentZone.x + currentZone.w ||
-                    centerY < currentZone.y || centerY > currentZone.y + currentZone.h) {
-                    isInsideZone = false;
-                }
-            }
-
-            const shoulderMidX = (leftShoulder.x + rightShoulder.x) / 2;
+            // 1. Crawling / Falling Check
             const shoulderMidY = (leftShoulder.y + rightShoulder.y) / 2;
-            const hipMidX = (leftHip.x + rightHip.x) / 2;
             const hipMidY = (leftHip.y + rightHip.y) / 2;
-
-            const spineDx = Math.abs(shoulderMidX - hipMidX);
+            const spineDx = Math.abs((leftShoulder.x + rightShoulder.x)/2 - (leftHip.x + rightHip.x)/2);
             const spineDy = Math.abs(shoulderMidY - hipMidY);
-            const sensFactor = sens / 5;
-
-            if (spineDx > spineDy * (0.8 / sensFactor)) {
-                actionScore += 2;
-            }
-
-            const boxW = maxX - minX;
-            const boxH = maxY - minY;
-            const aspectRatio = boxW / boxH;
-
-            if (aspectRatio > 0.9) actionScore += 1;
-            if (aspectRatio > (1.2 / sensFactor)) actionScore += 1; 
-
-            const hipsY = hipMidY; 
-            let handsDown = false;
-            if (leftWrist && leftWrist.visibility > 0.5 && leftWrist.y > hipsY) handsDown = true;
-            if (rightWrist && rightWrist.visibility > 0.5 && rightWrist.y > hipsY) handsDown = true;
             
-            if (handsDown) actionScore += 1;
-
-            if (nose && nose.visibility > 0.5) {
-                const headHipDistY = Math.abs(nose.y - hipMidY);
-                const normalizedBoxH = (maxY - minY) / height;
-                if (headHipDistY < normalizedBoxH * (0.4 * sensFactor)) { 
-                    actionScore += 1; 
-                }
-            }
-
-            let currentAction = 'walking';
-            if (actionScore >= 2.5) {
+            if (spineDx > spineDy * (0.8 / sensFactor)) {
                 currentAction = 'crawling';
             }
 
-            if (currentAction === 'crawling') {
-                consecutiveFramesRef.current += 1;
-            } else {
-                consecutiveFramesRef.current = Math.max(0, consecutiveFramesRef.current - 1);
+            // 2. Fighting / Assault (Velocity + Arms raised)
+            if (velocityScore > 1) {
+                // Check if hands are above chest height
+                if ((leftWrist && leftWrist.y < leftShoulder.y) || (rightWrist && rightWrist.y < rightShoulder.y)) {
+                    currentAction = 'fighting';
+                } else if (velocityScore > 3) {
+                    currentAction = 'assault'; // Very high movement
+                }
             }
 
-            let finalAction = consecutiveFramesRef.current > (15 - sens) ? 'crawling' : 'walking';
-            let isCrawling = finalAction === 'crawling';
+            // 3. Stealing / Shoplifting (Hands interacting near body/pockets or low)
+            if (currentAction === 'normal') {
+                if (leftWrist && rightWrist) {
+                     // Hands very close to hips or below hips but not fast moving
+                     const handsNearHips = Math.abs(leftWrist.y - leftHip.y) < 0.1 || Math.abs(rightWrist.y - rightHip.y) < 0.1;
+                     if (handsNearHips && velocityScore < 0.5) {
+                         // This is weak, but simulates suspicious hand placement
+                         // Refine: if aspect ratio is normal but hands are acting weird
+                     }
+                }
+            }
             
-            if (!isInsideZone && isCrawling) {
-                isCrawling = false;
-                finalAction = 'loitering outside zone'; 
+            // 4. Vandalism (Hands above head for extended time, or rapid movement on walls)
+            if (currentAction === 'normal') {
+                if (leftWrist && rightWrist && nose) {
+                    // Hands significantly above head
+                    if (leftWrist.y < nose.y - 0.1 || rightWrist.y < nose.y - 0.1) {
+                        if (velocityScore > 0.5) {
+                            currentAction = 'vandalism';
+                        }
+                    }
+                }
             }
+          }
 
-            ctx.beginPath();
-            ctx.lineWidth = 3;
-            ctx.strokeStyle = isCrawling ? '#f43f5e' : (isInsideZone ? '#10b981' : '#64748b'); 
-            ctx.rect(minX, minY, boxW, boxH);
-            ctx.stroke();
+          // Persistence Filter (Smoothing)
+          if (currentAction !== 'normal') {
+              consecutiveFramesRef.current += 1;
+          } else {
+              consecutiveFramesRef.current = Math.max(0, consecutiveFramesRef.current - 1);
+          }
 
-            ctx.fillStyle = isCrawling ? '#f43f5e' : (isInsideZone ? '#10b981' : '#64748b');
-            ctx.fillRect(minX, minY - 30, boxW, 30);
-            ctx.fillStyle = '#ffffff';
-            ctx.font = 'bold 14px monospace';
-            ctx.fillText(
-              `${finalAction.toUpperCase()} ${(visibilityScore * 100).toFixed(0)}%`, 
-              minX + 5, 
-              minY - 10
-            );
+          let finalAction = consecutiveFramesRef.current > (10 - sens) ? currentAction : 'normal';
+          
+          // Zone Filtering
+          const xValues = landmarks.map((l: any) => l.x);
+          const yValues = landmarks.map((l: any) => l.y);
+          const minX = Math.min(...xValues) * width;
+          const maxX = Math.max(...xValues) * width;
+          const minY = Math.min(...yValues) * height;
+          const maxY = Math.max(...yValues) * height;
+          const boxW = maxX - minX;
+          const boxH = maxY - minY;
+          const centerX = minX + boxW / 2;
+          const centerY = minY + boxH / 2;
 
-            let snapshotData: string | undefined = undefined;
-            if (isCrawling && Date.now() - lastSnapshotTimeRef.current > 5000) {
-                snapshotData = canvasRef.current.toDataURL('image/jpeg', 0.6);
-                lastSnapshotTimeRef.current = Date.now();
+          let isInsideZone = true;
+          if (currentZone) {
+            if (centerX < currentZone.x || centerX > currentZone.x + currentZone.w ||
+                centerY < currentZone.y || centerY > currentZone.y + currentZone.h) {
+                isInsideZone = false;
             }
+          }
 
-            if (onDetectionUpdateRef.current) {
-              onDetectionUpdateRef.current(isCrawling, visibilityScore, finalAction, snapshotData);
-            }
+          if (!isInsideZone && finalAction !== 'normal') {
+             // If detected something but outside zone, maybe just loitering or normal
+             finalAction = 'loitering'; // Or just ignore
+          }
+
+          const isSuspicious = finalAction !== 'normal' && finalAction !== 'loitering';
+
+          // Visuals
+          ctx.beginPath();
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = isSuspicious ? '#f43f5e' : (isInsideZone ? '#10b981' : '#64748b'); 
+          ctx.rect(minX, minY, boxW, boxH);
+          ctx.stroke();
+
+          ctx.fillStyle = isSuspicious ? '#f43f5e' : (isInsideZone ? '#10b981' : '#64748b');
+          ctx.fillRect(minX, minY - 30, boxW, 30);
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 14px monospace';
+          ctx.fillText(
+            `${finalAction.toUpperCase()} ${(visibilityScore * 100).toFixed(0)}%`, 
+            minX + 5, 
+            minY - 10
+          );
+
+          let snapshotData: string | undefined = undefined;
+          if (isSuspicious && Date.now() - lastSnapshotTimeRef.current > 5000) {
+              snapshotData = canvasRef.current.toDataURL('image/jpeg', 0.6);
+              lastSnapshotTimeRef.current = Date.now();
+          }
+
+          if (onDetectionUpdateRef.current) {
+            onDetectionUpdateRef.current(isSuspicious, visibilityScore, finalAction, snapshotData);
           }
       } else {
            if (onDetectionUpdateRef.current) onDetectionUpdateRef.current(false, 0, 'none');

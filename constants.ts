@@ -31,6 +31,14 @@ export const MOCK_FEATURES = [
 ];
 
 export const DEMO_LOGS = [
-  { id: '1', timestamp: new Date(Date.now() - 100000), type: 'walking', confidence: 0.95, status: SecurityStatus.SAFE, message: 'Person walking detected' },
-  { id: '2', timestamp: new Date(Date.now() - 80000), type: 'walking', confidence: 0.92, status: SecurityStatus.SAFE, message: 'Person walking detected' },
+  { id: '1', timestamp: new Date(Date.now() - 100000), type: 'normal', confidence: 0.95, status: SecurityStatus.SAFE, message: 'Person walking detected' },
+  { id: '2', timestamp: new Date(Date.now() - 80000), type: 'normal', confidence: 0.92, status: SecurityStatus.SAFE, message: 'Person walking detected' },
 ];
+
+// Heuristic Thresholds for Action Detection
+export const ACTION_THRESHOLDS = {
+  FIGHTING_VELOCITY: 0.05, // Movement speed of wrists/ankles per frame
+  STEALING_HAND_HEIGHT: 0.4, // Relative Y position of hands
+  ASSAULT_PROXIMITY: 0.1, // If multiple skeletons, how close they are
+  VANDALISM_ARM_EXTENSION: 0.8, // Arm extension ratio
+};

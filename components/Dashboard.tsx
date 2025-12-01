@@ -153,7 +153,7 @@ export const Dashboard: React.FC = () => {
             };
             if ('speechSynthesis' in window && isMonitoring) {
                 if (!window.speechSynthesis.speaking) {
-                    const utterance = new SpeechSynthesisUtterance("Warning. Intruder.");
+                    const utterance = new SpeechSynthesisUtterance(`Warning. ${actionType} detected.`);
                     utterance.rate = 1.3;
                     window.speechSynthesis.speak(utterance);
                 }
@@ -161,7 +161,7 @@ export const Dashboard: React.FC = () => {
             setStats(s => ({ ...s, totalAlerts: s.totalAlerts + 1 }));
             return [...prev.slice(-49), newEvent];
         } 
-        else if (confidence > 0.6 && timeDiff > 10000 && actionType !== 'none') {
+        else if (confidence > 0.6 && timeDiff > 10000 && actionType !== 'none' && actionType !== 'normal') {
              const newEvent: DetectionEvent = {
                 id: now.toString(),
                 timestamp: new Date(),
@@ -341,7 +341,7 @@ export const Dashboard: React.FC = () => {
                 </div>
 
                 {/* AI Tuning Panel */}
-                <div className="space-y-3">
+                <div>
                     <div className="flex items-center justify-between px-1">
                         <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center">
                             <Sliders className="w-3 h-3 mr-2" /> Neural Config
