@@ -1,3 +1,4 @@
+
 export enum SecurityStatus {
   SAFE = 'SAFE',
   WARNING = 'WARNING',
@@ -5,23 +6,14 @@ export enum SecurityStatus {
 }
 
 export type ActionType = 
-  | 'normal' 
-  | 'abuse' 
-  | 'arrest' 
-  | 'arson' 
-  | 'assault' 
-  | 'burglary' 
-  | 'explosion' 
-  | 'fighting' 
-  | 'roadaccidents' 
-  | 'robbery' 
-  | 'shooting' 
-  | 'shoplifting' 
-  | 'stealing' 
-  | 'vandalism'
-  | 'crawling'
-  | 'loitering'
-  | 'walking';
+  // Safety/Crimes
+  | 'normal' | 'fighting' | 'stealing' | 'climbing' | 'crawling' | 'concealment' | 'burglary' 
+  // Postures
+  | 'sitting' | 'standing' | 'lying_down' | 'crouching' | 'jumping' | 'falling' | 'loitering' | 'walking'
+  // Gestures
+  | 'waving' | 'surrender' | 'pointing' | 'crossed_arms' | 'hands_on_hips' | 'clapping'
+  // Emotions/States (Inferred from body language)
+  | 'distressed' | 'confused' | 'aggressive' | 'defeated' | 'none';
 
 export interface DetectionEvent {
   id: string;
@@ -30,21 +22,43 @@ export interface DetectionEvent {
   confidence: number;
   status: SecurityStatus;
   message: string;
-  thumbnail?: string; // Base64 image string
+  thumbnail?: string;
+  aiSummary?: string;
+  matchedIdentity?: string;
 }
 
-export interface SystemStats {
-  fps: number;
-  activeCameras: number;
-  uptime: string;
-  totalAlerts: number;
+export interface SkeletalSignature {
+  ratios: {
+    torsoAspect: number;    // Shoulder Width / Torso Height
+    limbProportion: number; // Arm Length / Leg Length
+    frameScale: number;     // Shoulder Width / Hip Width
+    extremityRatio: number; // Forearm / Upper Arm
+  };
+  gaitCadence: number;
+  stabilityScore: number;
+  hash: string;
 }
 
-export interface ZoneRect {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
+export interface RegisteredProfile {
+  id: string;
+  name: string;
+  role: 'family' | 'guest' | 'staff';
+  signature: SkeletalSignature;
+  lastSeen?: Date;
 }
 
+export interface ZoneRect { x: number; y: number; w: number; h: number; }
 export type ViewState = 'landing' | 'dashboard';
+export type SimulationScenario = 'none' | 'walking' | 'crawling' | 'fighting' | 'stealing' | 'climbing';
+
+export interface AIAnalysis {
+  riskScore: number;
+  summary: string;
+  recommendation: string;
+  contextProfile?: string;
+}
+
+export interface ChatMessage {
+  role: 'user' | 'model';
+  text: string;
+}

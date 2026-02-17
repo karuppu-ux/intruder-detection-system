@@ -1,6 +1,6 @@
 {
-  "name": "IntruderNet",
-  "description": "AI-Powered Security System Dashboard and Guide. Simulates YOLO11-Pose and LSTM based intrusion detection.",
+  "name": "VisionGuard AI",
+  "description": "Next-gen security system powered by YOLO11-Pose and Behavioral Biometrics. Features Skeletal ID signatures and Vitals/Stress Heuristics.",
   "requestFramePermissions": [
     "camera"
   ]

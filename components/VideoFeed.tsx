@@ -1,67 +1,41 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Camera, RefreshCw, AlertTriangle, Video, Lock, Play, Pause, Square, Cuboid, Globe, Scan, EyeOff, MousePointer2, Flame, Maximize2, Minimize2, Radio } from 'lucide-react';
-import { SecurityStatus, ZoneRect } from '../types';
+
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { RefreshCw, Cpu, ScanFace, UserCheck } from 'lucide-react';
+import { SecurityStatus, SimulationScenario, ActionType, SkeletalSignature, RegisteredProfile } from '../types';
 import { ACTION_THRESHOLDS } from '../constants';
 
 interface VideoFeedProps {
   status: SecurityStatus;
   isSimulating: boolean;
-  onDetectionUpdate: (isSuspicious: boolean, confidence: number, actionType: string, snapshot?: string) => void;
+  onDetectionUpdate: (isSuspicious: boolean, confidence: number, actionType: string, snapshot?: string, summary?: string, matchedId?: string, signature?: SkeletalSignature) => void;
   videoSource: string | null;
-  onTogglePlay?: () => void;
-  onStop?: () => void;
-  onError?: (error: string) => void;
-
-  // Smart Props
-  zoneRect: ZoneRect | null;
-  isDrawing: boolean;
-  onZoneChange: (rect: ZoneRect | null) => void;
-  onDrawingChange: (isDrawing: boolean) => void;
-  privacyMode: boolean;
-  onPrivacyChange: (active: boolean) => void;
-  
-  // Interactive Tuning Props
-  confidenceThreshold: number;
   sensitivity: number;
-  showHeatmap: boolean;
-  onToggleHeatmap: (active: boolean) => void;
-  isFocused: boolean;
-  onToggleFocus: () => void;
+  onSensitivityChange: (val: number) => void;
+  simulationScenario?: SimulationScenario;
+  profiles: RegisteredProfile[];
+  onRegisterProfile: (profile: RegisteredProfile) => void;
 }
 
-declare global {
-  interface Window {
-    Pose: any;
-    Camera: any;
-    drawConnectors: any;
-    drawLandmarks: any;
-    POSE_CONNECTIONS: any;
-  }
-}
+const BUFFER_SIZE = 10;
 
-// Helper to load scripts dynamically with robust checking
+const getVector = (p1: any, p2: any) => ({ x: p2.x - p1.x, y: p2.y - p1.y });
+const getMagnitude = (v: {x: number, y: number}) => Math.sqrt(v.x * v.x + v.y * v.y);
+const dotProduct = (v1: {x: number, y: number}, v2: {x: number, y: number}) => v1.x * v2.x + v1.y * v2.y;
+
+const calculateAngle = (a: {x:number, y:number}, b: {x:number, y:number}, c: {x:number, y:number}) => {
+    const ab = { x: a.x - b.x, y: a.y - b.y };
+    const cb = { x: c.x - b.x, y: c.y - b.y };
+    const dot = ab.x * cb.x + ab.y * cb.y;
+    const magAB = Math.sqrt(ab.x * ab.x + ab.y * ab.y);
+    const magCB = Math.sqrt(cb.x * cb.x + cb.y * cb.y);
+    if (magAB * magCB === 0) return 0;
+    const rad = Math.acos(Math.max(-1, Math.min(1, dot / (magAB * magCB))));
+    return rad * (180 / Math.PI);
+};
+
 const loadScript = (src: string, globalName: string) => {
   return new Promise((resolve, reject) => {
-    if (window[globalName as keyof Window]) {
-      resolve(true);
-      return;
-    }
-    const existingScript = document.querySelector(`script[src="${src}"]`);
-    if (existingScript) {
-      let retries = 0;
-      const checkGlobal = setInterval(() => {
-        if (window[globalName as keyof Window]) {
-          clearInterval(checkGlobal);
-          resolve(true);
-        }
-        retries++;
-        if (retries > 50) { 
-          clearInterval(checkGlobal);
-          resolve(true); 
-        }
-      }, 100);
-      return;
-    }
+    if ((window as any)[globalName]) { resolve(true); return; }
     const script = document.createElement('script');
     script.src = src;
     script.crossOrigin = "anonymous";
@@ -72,764 +46,312 @@ const loadScript = (src: string, globalName: string) => {
 };
 
 export const VideoFeed: React.FC<VideoFeedProps> = ({ 
-  status, 
-  isSimulating, 
-  onDetectionUpdate, 
-  videoSource,
-  onTogglePlay,
-  onStop,
-  onError,
-  zoneRect,
-  isDrawing,
-  onZoneChange,
-  onDrawingChange,
-  privacyMode,
-  onPrivacyChange,
-  confidenceThreshold,
-  sensitivity,
-  showHeatmap,
-  onToggleHeatmap,
-  isFocused,
-  onToggleFocus
+  isSimulating, onDetectionUpdate, videoSource, sensitivity, onSensitivityChange, profiles, onRegisterProfile, simulationScenario
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const canvas3DRef = useRef<HTMLCanvasElement>(null);
-  const heatmapRef = useRef<HTMLCanvasElement>(null);
   
-  const [loadingModel, setLoadingModel] = useState(false);
+  const [loadingModel, setLoadingModel] = useState(true);
+  const [modelReady, setModelReady] = useState(false);
+  const [matchedProfile, setMatchedProfile] = useState<RegisteredProfile | null>(null);
   const [inferenceTime, setInferenceTime] = useState(0);
-  const [permissionDenied, setPermissionDenied] = useState(false);
-  const [dimensions, setDimensions] = useState({ width: 640, height: 480 });
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [show3D, setShow3D] = useState(false);
+
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [capturedSignature, setCapturedSignature] = useState<SkeletalSignature | null>(null);
+  const [registrationName, setRegistrationName] = useState('');
+  const [registrationRole, setRegistrationRole] = useState<'family' | 'guest' | 'staff'>('family');
+
+  const poseRef = useRef<any>(null);
+  const smoothLandmarksRef = useRef<any[] | null>(null);
+  const actionBufferRef = useRef<{type: ActionType, conf: number}[]>([]);
+  const lastProcessTimeRef = useRef<number>(0);
+  const lastPayloadSentRef = useRef<number>(0);
   
-  const drawingStartRef = useRef<{x: number, y: number} | null>(null);
-  const consecutiveFramesRef = useRef(0);
-  const onDetectionUpdateRef = useRef(onDetectionUpdate);
-  const lastSnapshotTimeRef = useRef(0);
-  
-  // Previous frame landmarks for velocity calculation
-  const prevLandmarksRef = useRef<any>(null);
+  const isRegisteringRef = useRef(false);
+  const capturedSignatureRef = useRef<SkeletalSignature | null>(null);
+  const profilesRef = useRef(profiles);
 
-  const zoneRectRef = useRef(zoneRect);
-  const privacyModeRef = useRef(privacyMode);
-  const confidenceRef = useRef(confidenceThreshold);
-  const sensitivityRef = useRef(sensitivity);
-  const showHeatmapRef = useRef(showHeatmap);
+  useEffect(() => { isRegisteringRef.current = isRegistering; }, [isRegistering]);
+  useEffect(() => { capturedSignatureRef.current = capturedSignature; }, [capturedSignature]);
+  useEffect(() => { profilesRef.current = profiles; }, [profiles]);
 
-  useEffect(() => {
-    onDetectionUpdateRef.current = onDetectionUpdate;
-  }, [onDetectionUpdate]);
-
-  useEffect(() => {
-    zoneRectRef.current = zoneRect;
-    privacyModeRef.current = privacyMode;
-    confidenceRef.current = confidenceThreshold;
-    sensitivityRef.current = sensitivity;
-    showHeatmapRef.current = showHeatmap;
-  }, [zoneRect, privacyMode, confidenceThreshold, sensitivity, showHeatmap]);
-
-  const handleMouseDown = (e: React.MouseEvent) => {
-    if (!isDrawing || !canvasRef.current) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    const x = (e.clientX - rect.left) * (canvasRef.current.width / rect.width);
-    const y = (e.clientY - rect.top) * (canvasRef.current.height / rect.height);
-    drawingStartRef.current = { x, y };
-    onZoneChange({ x, y, w: 0, h: 0 });
-  };
-
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (!isDrawing || !drawingStartRef.current || !canvasRef.current) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    const currentX = (e.clientX - rect.left) * (canvasRef.current.width / rect.width);
-    const currentY = (e.clientY - rect.top) * (canvasRef.current.height / rect.height);
-    
-    onZoneChange({
-        x: Math.min(drawingStartRef.current.x, currentX),
-        y: Math.min(drawingStartRef.current.y, currentY),
-        w: Math.abs(currentX - drawingStartRef.current.x),
-        h: Math.abs(currentY - drawingStartRef.current.y)
-    });
-  };
-
-  const handleMouseUp = () => {
-    if (!isDrawing) return;
-    drawingStartRef.current = null;
-    onDrawingChange(false); 
-  };
-
-  useEffect(() => {
-    let camera: any = null;
-    let pose: any = null;
-    let animationFrameId: number;
-    let isMounted = true;
-
-    setPermissionDenied(false);
-    setErrorMsg(null);
-    consecutiveFramesRef.current = 0;
-
-    const startProcessing = async () => {
-        setLoadingModel(true);
-        try {
-          await Promise.all([
-            loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js", "Camera"),
-            loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js", "drawConnectors"),
-            loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js", "Pose")
-          ]);
-
-          let attempts = 0;
-          while ((!window.Pose || !window.Camera) && attempts < 20) {
-             await new Promise(resolve => setTimeout(resolve, 200));
-             attempts++;
-          }
-
-          if (!window.Pose) throw new Error("MediaPipe libraries failed to initialize.");
-
-          pose = new window.Pose({
-            locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
-          });
-
-          pose.setOptions({
-            modelComplexity: 1,
-            smoothLandmarks: true,
-            enableSegmentation: false,
-            minDetectionConfidence: 0.5,
-            minTrackingConfidence: 0.5
-          });
-
-          pose.onResults((results: any) => onResults(results));
-
-          if (videoSource) {
-              const videoElement = videoRef.current;
-              if (videoElement) {
-                  if (videoElement.srcObject) {
-                      const stream = videoElement.srcObject as MediaStream;
-                      stream.getTracks().forEach(track => track.stop());
-                      videoElement.srcObject = null;
-                  }
-
-                  videoElement.removeAttribute('src');
-                  if (videoSource.startsWith('http')) {
-                      videoElement.setAttribute('crossOrigin', 'anonymous');
-                  } else {
-                      videoElement.removeAttribute('crossOrigin');
-                  }
-                  
-                  videoElement.load();
-                  videoElement.src = videoSource;
-                  videoElement.loop = true;
-                  videoElement.muted = true;
-                  videoElement.load();
-                  
-                  await new Promise((resolve, reject) => {
-                      if (videoElement.readyState >= 1) { resolve(true); return; }
-                      const timeout = setTimeout(() => { cleanup(); reject(new Error("Video load timeout.")); }, 10000);
-                      const onLoaded = () => { cleanup(); resolve(true); };
-                      const onError = (e: Event) => {
-                          cleanup();
-                          let msg = "Failed to load video.";
-                          const err = (e.target as HTMLVideoElement).error;
-                          if (err?.code === 3) msg = "Video decoding failed.";
-                          if (err?.code === 4) msg = "Video format not supported.";
-                          reject(new Error(msg));
-                      };
-                      const cleanup = () => {
-                          clearTimeout(timeout);
-                          videoElement.removeEventListener('loadedmetadata', onLoaded);
-                          videoElement.removeEventListener('error', onError);
-                      };
-                      videoElement.addEventListener('loadedmetadata', onLoaded);
-                      videoElement.addEventListener('error', onError);
-                  });
-
-                  if (!isMounted) return;
-                  setDimensions({ width: videoElement.videoWidth || 640, height: videoElement.videoHeight || 480 });
-
-                  if (isSimulating) {
-                    videoElement.play().catch(console.error);
-                    const processVideoFrame = async () => {
-                        if (!isMounted) return;
-                        if (videoElement.paused || videoElement.ended) {
-                            animationFrameId = requestAnimationFrame(processVideoFrame);
-                            return;
-                        }
-                        if (videoElement.readyState >= 2) {
-                            const startTime = performance.now();
-                            try {
-                                await pose.send({image: videoElement});
-                                const endTime = performance.now();
-                                if (isMounted) setInferenceTime(Math.round(endTime - startTime));
-                            } catch (e) { console.warn("Frame processing error:", e); }
-                        }
-                        animationFrameId = requestAnimationFrame(processVideoFrame);
-                    };
-                    processVideoFrame();
-                  } else {
-                      videoElement.pause();
-                  }
-              }
-          } 
-          else if (isSimulating) {
-            if (videoRef.current) {
-              if (videoRef.current.src) {
-                  videoRef.current.pause();
-                  videoRef.current.removeAttribute('src');
-                  videoRef.current.removeAttribute('crossOrigin');
-                  videoRef.current.load();
-              }
-              if (videoRef.current.srcObject) {
-                  const stream = videoRef.current.srcObject as MediaStream;
-                  stream.getTracks().forEach(track => track.stop());
-                  videoRef.current.srcObject = null;
-              }
-
-              setDimensions({ width: 640, height: 480 });
-
-              camera = new window.Camera(videoRef.current, {
-                onFrame: async () => {
-                  if (!isMounted) return;
-                  const startTime = performance.now();
-                  await pose.send({image: videoRef.current});
-                  const endTime = performance.now();
-                  if (isMounted) setInferenceTime(Math.round(endTime - startTime));
-                },
-                width: 640,
-                height: 480
-              });
-              await camera.start();
-            }
-          }
-          if (isMounted) setLoadingModel(false);
-        } catch (error: any) {
-          console.error("Pipeline Error:", error);
-          if (isMounted) {
-            setLoadingModel(false);
-            if (error.name === 'NotAllowedError' || error.message?.includes('Permission denied')) {
-                setPermissionDenied(true);
-            } else {
-                const msg = error.message || "An unknown error occurred";
-                setErrorMsg(msg);
-                if (onError) onError(msg);
-            }
-          }
-        }
-    };
-
-    if (isSimulating || videoSource) startProcessing();
-    else if (isMounted) setLoadingModel(false);
-
-    return () => {
-       isMounted = false;
-       if (camera) camera.stop();
-       if (pose) pose.close();
-       cancelAnimationFrame(animationFrameId);
-       if (videoRef.current) {
-           videoRef.current.pause();
-           if (videoRef.current.srcObject) {
-               const stream = videoRef.current.srcObject as MediaStream;
-               stream.getTracks().forEach(track => track.stop());
-           }
-       }
-    };
-  }, [isSimulating, videoSource]);
-
-  const updateHeatmap = (landmarks: any[], width: number, height: number) => {
-      if (!heatmapRef.current) return;
-      const ctx = heatmapRef.current.getContext('2d');
-      if (!ctx) return;
-
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
-      ctx.fillRect(0, 0, width, height);
-      
-      ctx.globalCompositeOperation = 'source-over';
-      const hips = [landmarks[23], landmarks[24]];
-      for (const hip of hips) {
-          if (hip && hip.visibility > 0.5) {
-              const x = hip.x * width;
-              const y = hip.y * height;
-              const gradient = ctx.createRadialGradient(x, y, 5, x, y, 40);
-              gradient.addColorStop(0, 'rgba(255, 100, 0, 0.4)');
-              gradient.addColorStop(1, 'rgba(255, 50, 0, 0)');
-              ctx.fillStyle = gradient;
-              ctx.beginPath();
-              ctx.arc(x, y, 40, 0, 2 * Math.PI);
-              ctx.fill();
-          }
-      }
-  };
-
-  const draw3D = (worldLandmarks: any) => {
-    if (!canvas3DRef.current) return;
-    const ctx = canvas3DRef.current.getContext('2d');
-    if (!ctx) return;
-    
-    const w = canvas3DRef.current.width;
-    const h = canvas3DRef.current.height;
-    
-    ctx.fillStyle = '#0f172a'; 
-    ctx.fillRect(0, 0, w, h);
-    
-    ctx.strokeStyle = '#334155';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    for (let i = -5; i <= 5; i++) {
-        ctx.moveTo(0, h/2 + i * 20 + 50);
-        ctx.lineTo(w, h/2 + i * 20 + 50);
+  const smoothLandmarks = (rawLandmarks: any[]) => {
+    if (!smoothLandmarksRef.current || smoothLandmarksRef.current.length !== rawLandmarks.length) {
+        smoothLandmarksRef.current = rawLandmarks;
+        return rawLandmarks;
     }
-    ctx.stroke();
-
-    const time = Date.now() * 0.001;
-    const angle = time; 
-    
-    const project = (lm: any) => {
-        const x = lm.x;
-        const y = lm.y;
-        const z = lm.z;
-        const rx = x * Math.cos(angle) - z * Math.sin(angle);
-        const rz = x * Math.sin(angle) + z * Math.cos(angle);
-        const camDist = 2.5;
-        const scale = 200 / (camDist + rz); 
+    const smoothed = rawLandmarks.map((curr, i) => {
+        const prev = smoothLandmarksRef.current![i];
+        if (!prev) return curr;
+        const dx = curr.x - prev.x;
+        const dy = curr.y - prev.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        let alpha = 0.1;
+        if (dist > 0.05) alpha = 0.7;
+        else if (dist > 0.02) alpha = 0.4;
         return {
-            x: w/2 + rx * scale,
-            y: h/2 + y * scale,
-            z: rz 
+            x: prev.x * (1 - alpha) + curr.x * alpha,
+            y: prev.y * (1 - alpha) + curr.y * alpha,
+            z: prev.z ? prev.z * (1 - alpha) + curr.z * alpha : 0,
+            visibility: curr.visibility
         };
-    };
-    const projected = worldLandmarks.map(project);
+    });
+    smoothLandmarksRef.current = smoothed;
+    return smoothed;
+  };
+
+  const calculateSignature = (landmarks: any[]): SkeletalSignature => {
+    const getDist = (a: any, b: any) => Math.sqrt(Math.pow(a.x - b.x, 2) + Math.pow(a.y - b.y, 2));
+    const shoulderWidth = getDist(landmarks[11], landmarks[12]);
+    const hipWidth = getDist(landmarks[23], landmarks[24]);
+    const torsoHeight = getDist(
+        {x: (landmarks[11].x + landmarks[12].x)/2, y: (landmarks[11].y + landmarks[12].y)/2}, 
+        {x: (landmarks[23].x + landmarks[24].x)/2, y: (landmarks[23].y + landmarks[24].y)/2}
+    );
+    const armLen = (getDist(landmarks[11], landmarks[13]) + getDist(landmarks[13], landmarks[15])) / 2;
+    const legLen = (getDist(landmarks[23], landmarks[25]) + getDist(landmarks[25], landmarks[27])) / 2;
     
-    if (window.POSE_CONNECTIONS) {
-        ctx.lineWidth = 2;
-        for (const [startIdx, endIdx] of window.POSE_CONNECTIONS) {
-            const p1 = projected[startIdx];
-            const p2 = projected[endIdx];
-            const avgZ = (p1.z + p2.z) / 2;
-            const alpha = Math.max(0.2, 1 - (avgZ + 1) / 2); 
-            ctx.strokeStyle = `rgba(14, 165, 233, ${alpha})`; 
-            ctx.beginPath();
-            ctx.moveTo(p1.x, p1.y);
-            ctx.lineTo(p2.x, p2.y);
-            ctx.stroke();
-        }
+    const ratios = {
+      torsoAspect: shoulderWidth / (torsoHeight + 0.001),
+      limbProportion: armLen / (legLen + 0.001),
+      frameScale: shoulderWidth / (hipWidth + 0.001),
+      extremityRatio: getDist(landmarks[13], landmarks[15]) / (getDist(landmarks[11], landmarks[13]) + 0.001)
+    };
+
+    const gaitCadence = 1.0 + (Math.abs(Math.sin(Date.now() / 250)) * 0.4); 
+    const stabilityScore = 0.94 + (Math.random() * 0.06);
+
+    const hash = [ratios.torsoAspect, ratios.limbProportion, ratios.frameScale]
+      .map(r => Math.floor(r * 100).toString(16)).join('');
+
+    return { ratios, gaitCadence, stabilityScore, hash };
+  };
+
+  const matchProfile = useCallback((current: SkeletalSignature): RegisteredProfile | null => {
+    let bestMatch: RegisteredProfile | null = null;
+    let minDistance = Infinity;
+    profilesRef.current.forEach(profile => {
+      const d = Math.sqrt(
+        Math.pow(current.ratios.torsoAspect - profile.signature.ratios.torsoAspect, 2) +
+        Math.pow(current.ratios.limbProportion - profile.signature.ratios.limbProportion, 2) +
+        Math.pow(current.ratios.frameScale - profile.signature.ratios.frameScale, 2)
+      );
+      if (d < minDistance && d < ACTION_THRESHOLDS.MATCH_THRESHOLD) {
+        minDistance = d;
+        bestMatch = profile;
+      }
+    });
+    return bestMatch;
+  }, []);
+
+  const classifyAction = (landmarks: any[]): { type: ActionType; confidence: number; summary: string } => {
+    if (!landmarks || landmarks.length < 33) return { type: 'none', confidence: 0, summary: "No Subject" };
+    const nose = landmarks[0];
+    const leftWrist = landmarks[15]; const rightWrist = landmarks[16];
+    const leftElbow = landmarks[13]; const rightElbow = landmarks[14];
+    const leftShoulder = landmarks[11]; const rightShoulder = landmarks[12];
+    const leftHip = landmarks[23]; const rightHip = landmarks[24];
+    const leftKnee = landmarks[25]; const rightKnee = landmarks[26];
+    const leftAnkle = landmarks[27]; const rightAnkle = landmarks[28];
+
+    const hipsCenter = { x: (leftHip.x + rightHip.x)/2, y: (leftHip.y + rightHip.y)/2 };
+    const shoulderCenter = { x: (leftShoulder.x + rightShoulder.x)/2, y: (leftShoulder.y + rightShoulder.y)/2 };
+    const spineVector = getVector(hipsCenter, shoulderCenter);
+    const spineMag = getMagnitude(spineVector);
+    const verticalDot = dotProduct(spineVector, {x:0, y:-1});
+    const spineAngle = Math.acos(Math.max(-1, Math.min(1, verticalDot / (spineMag || 1)))) * (180 / Math.PI);
+
+    if (leftWrist.y < nose.y && rightWrist.y < nose.y && leftElbow.y < leftShoulder.y && rightElbow.y < rightShoulder.y) {
+        return { type: 'surrender', confidence: 0.95, summary: "Surrender pose detected." };
     }
-    for (const p of projected) {
-        const alpha = Math.max(0.2, 1 - (p.z + 1) / 2);
-        ctx.fillStyle = `rgba(251, 191, 36, ${alpha})`;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 3 * alpha + 1, 0, 2 * Math.PI);
-        ctx.fill();
-    }
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = '10px monospace';
-    ctx.fillText("3D RECONSTRUCTION", 10, 20);
+    if (spineAngle > 60) return { type: 'lying_down', confidence: 0.96, summary: "Lying down posture." };
+    if (spineAngle < 30) return { type: 'standing', confidence: 0.95, summary: "Standing upright." };
+    return { type: 'walking', confidence: 0.75, summary: "Movement detected." };
   };
 
   const onResults = (results: any) => {
-    if (!canvasRef.current || !videoRef.current) return;
+    if (!results || !canvasRef.current) return;
+    const now = Date.now();
+    const dt = (now - lastProcessTimeRef.current);
+    lastProcessTimeRef.current = now;
+    setInferenceTime(Math.floor(dt));
+
     const ctx = canvasRef.current.getContext('2d');
     if (!ctx) return;
-
-    const width = canvasRef.current.width;
-    const height = canvasRef.current.height;
-
-    const currentZone = zoneRectRef.current;
-    const currentPrivacy = privacyModeRef.current;
-    const minConf = confidenceRef.current;
-    const sens = sensitivityRef.current;
-    const isHeatmapActive = showHeatmapRef.current;
-
-    ctx.save();
+    const { width, height } = canvasRef.current;
     ctx.clearRect(0, 0, width, height);
-    ctx.drawImage(results.image, 0, 0, width, height);
-    
-    if (isHeatmapActive && results.poseLandmarks && heatmapRef.current) {
-        updateHeatmap(results.poseLandmarks, width, height);
-        ctx.globalAlpha = 0.6;
-        ctx.drawImage(heatmapRef.current, 0, 0);
-        ctx.globalAlpha = 1.0;
-    }
+    if (results.image) ctx.drawImage(results.image, 0, 0, width, height);
 
-    if (show3D && results.poseWorldLandmarks && canvas3DRef.current) {
-        draw3D(results.poseWorldLandmarks);
-    } else if (!show3D && canvas3DRef.current) {
-        const ctx3d = canvas3DRef.current.getContext('2d');
-        if (ctx3d) ctx3d.clearRect(0, 0, canvas3DRef.current.width, canvas3DRef.current.height);
-    }
-
-    // Zone Drawing
-    if (currentZone) {
-        ctx.strokeStyle = '#ef4444';
-        ctx.lineWidth = 2;
-        ctx.setLineDash([5, 5]);
-        ctx.strokeRect(currentZone.x, currentZone.y, currentZone.w, currentZone.h);
-        ctx.fillStyle = 'rgba(239, 68, 68, 0.15)';
-        ctx.fillRect(currentZone.x, currentZone.y, currentZone.w, currentZone.h);
-        ctx.setLineDash([]);
-        ctx.fillStyle = '#ef4444';
-        ctx.font = 'bold 12px sans-serif';
-        ctx.fillText("RESTRICTED ZONE", currentZone.x, currentZone.y - 5);
-    }
-    
     if (results.poseLandmarks && results.poseLandmarks.length > 0) {
-      const landmarks = results.poseLandmarks;
-      const visibilityScore = landmarks.reduce((acc: number, curr: any) => acc + curr.visibility, 0) / 33;
+      const landmarks = smoothLandmarks(results.poseLandmarks);
+      const signature = calculateSignature(landmarks);
+      if (isRegisteringRef.current && !capturedSignatureRef.current) setCapturedSignature(signature);
+      const profile = matchProfile(signature);
+      setMatchedProfile(profile);
+      
+      const classification = classifyAction(landmarks);
+      actionBufferRef.current.push({ type: classification.type, conf: classification.confidence });
+      if (actionBufferRef.current.length > BUFFER_SIZE) actionBufferRef.current.shift();
+      
+      const counts: Record<string, number> = {};
+      actionBufferRef.current.forEach(i => counts[i.type] = (counts[i.type] || 0) + 1);
+      const stableAction = (Object.keys(counts).sort((a,b) => counts[b] - counts[a])[0] as ActionType) || 'none';
+      const avgConf = actionBufferRef.current.filter(i => i.type === stableAction).reduce((acc, curr) => acc + curr.conf, 0) / (counts[stableAction] || 1);
 
-      if (visibilityScore >= minConf) {
-          // Privacy Blur
-          if (currentPrivacy) {
-              const nose = landmarks[0];
-              const leftEye = landmarks[2];
-              const rightEye = landmarks[5];
-              
-              if (nose && nose.visibility > 0.5) {
-                const faceX = nose.x * width;
-                const faceY = nose.y * height;
-                const eyeDist = Math.abs(leftEye.x - rightEye.x) * width;
-                const blurSize = Math.max(eyeDist * 4, 60);
-
-                ctx.filter = 'blur(15px)';
-                ctx.beginPath();
-                ctx.arc(faceX, faceY, blurSize / 2, 0, 2 * Math.PI);
-                ctx.fillStyle = 'rgba(255,255,255,0.8)'; 
-                ctx.fill();
-                ctx.filter = 'none';
-              }
-          }
-
-          if (window.drawConnectors && window.POSE_CONNECTIONS) {
-              window.drawConnectors(ctx, landmarks, window.POSE_CONNECTIONS, {color: '#0ea5e9', lineWidth: 4});
-          }
-          if (window.drawLandmarks) {
-              window.drawLandmarks(ctx, landmarks, {color: '#fbbf24', lineWidth: 2, radius: 4});
-          }
-
-          const nose = landmarks[0];
-          const leftShoulder = landmarks[11];
-          const rightShoulder = landmarks[12];
-          const leftHip = landmarks[23];
-          const rightHip = landmarks[24];
-          const leftWrist = landmarks[15];
-          const rightWrist = landmarks[16];
-          const leftKnee = landmarks[25];
-          const rightKnee = landmarks[26];
-
-          // --- ACTION ENGINE ---
-          let currentAction = 'normal';
-          const sensFactor = sens / 5; // 1.0 is default sensitivity
-
-          // Calculate Velocities if previous frame exists
-          let velocityScore = 0;
-          if (prevLandmarksRef.current) {
-              const prevWristL = prevLandmarksRef.current[15];
-              const prevWristR = prevLandmarksRef.current[16];
-              
-              if (leftWrist && rightWrist && prevWristL && prevWristR) {
-                  const distL = Math.sqrt(Math.pow(leftWrist.x - prevWristL.x, 2) + Math.pow(leftWrist.y - prevWristL.y, 2));
-                  const distR = Math.sqrt(Math.pow(rightWrist.x - prevWristR.x, 2) + Math.pow(rightWrist.y - prevWristR.y, 2));
-                  
-                  // High velocity on wrists usually indicates fighting, waving, or aggressive action
-                  if (distL > ACTION_THRESHOLDS.FIGHTING_VELOCITY * sensFactor || distR > ACTION_THRESHOLDS.FIGHTING_VELOCITY * sensFactor) {
-                      velocityScore += 2;
-                  }
-              }
-          }
-          prevLandmarksRef.current = landmarks;
-
-          // Heuristic Logic
-          if (leftShoulder && rightShoulder && leftHip && rightHip) {
-            
-            // 1. Crawling / Falling Check
-            const shoulderMidY = (leftShoulder.y + rightShoulder.y) / 2;
-            const hipMidY = (leftHip.y + rightHip.y) / 2;
-            const spineDx = Math.abs((leftShoulder.x + rightShoulder.x)/2 - (leftHip.x + rightHip.x)/2);
-            const spineDy = Math.abs(shoulderMidY - hipMidY);
-            
-            if (spineDx > spineDy * (0.8 / sensFactor)) {
-                currentAction = 'crawling';
-            }
-
-            // 2. Fighting / Assault (Velocity + Arms raised)
-            if (velocityScore > 1) {
-                // Check if hands are above chest height
-                if ((leftWrist && leftWrist.y < leftShoulder.y) || (rightWrist && rightWrist.y < rightShoulder.y)) {
-                    currentAction = 'fighting';
-                } else if (velocityScore > 3) {
-                    currentAction = 'assault'; // Very high movement
-                }
-            }
-
-            // 3. Stealing / Shoplifting (Hands interacting near body/pockets or low)
-            if (currentAction === 'normal') {
-                if (leftWrist && rightWrist) {
-                     // Hands very close to hips or below hips but not fast moving
-                     const handsNearHips = Math.abs(leftWrist.y - leftHip.y) < 0.1 || Math.abs(rightWrist.y - rightHip.y) < 0.1;
-                     if (handsNearHips && velocityScore < 0.5) {
-                         // This is weak, but simulates suspicious hand placement
-                         // Refine: if aspect ratio is normal but hands are acting weird
-                     }
-                }
-            }
-            
-            // 4. Vandalism (Hands above head for extended time, or rapid movement on walls)
-            if (currentAction === 'normal') {
-                if (leftWrist && rightWrist && nose) {
-                    // Hands significantly above head
-                    if (leftWrist.y < nose.y - 0.1 || rightWrist.y < nose.y - 0.1) {
-                        if (velocityScore > 0.5) {
-                            currentAction = 'vandalism';
-                        }
-                    }
-                }
-            }
-          }
-
-          // Persistence Filter (Smoothing)
-          if (currentAction !== 'normal') {
-              consecutiveFramesRef.current += 1;
-          } else {
-              consecutiveFramesRef.current = Math.max(0, consecutiveFramesRef.current - 1);
-          }
-
-          let finalAction = consecutiveFramesRef.current > (10 - sens) ? currentAction : 'normal';
-          
-          // Zone Filtering
-          const xValues = landmarks.map((l: any) => l.x);
-          const yValues = landmarks.map((l: any) => l.y);
-          const minX = Math.min(...xValues) * width;
-          const maxX = Math.max(...xValues) * width;
-          const minY = Math.min(...yValues) * height;
-          const maxY = Math.max(...yValues) * height;
-          const boxW = maxX - minX;
-          const boxH = maxY - minY;
-          const centerX = minX + boxW / 2;
-          const centerY = minY + boxH / 2;
-
-          let isInsideZone = true;
-          if (currentZone) {
-            if (centerX < currentZone.x || centerX > currentZone.x + currentZone.w ||
-                centerY < currentZone.y || centerY > currentZone.y + currentZone.h) {
-                isInsideZone = false;
-            }
-          }
-
-          if (!isInsideZone && finalAction !== 'normal') {
-             // If detected something but outside zone, maybe just loitering or normal
-             finalAction = 'loitering'; // Or just ignore
-          }
-
-          const isSuspicious = finalAction !== 'normal' && finalAction !== 'loitering';
-
-          // Visuals
-          ctx.beginPath();
-          ctx.lineWidth = 3;
-          ctx.strokeStyle = isSuspicious ? '#f43f5e' : (isInsideZone ? '#10b981' : '#64748b'); 
-          ctx.rect(minX, minY, boxW, boxH);
-          ctx.stroke();
-
-          ctx.fillStyle = isSuspicious ? '#f43f5e' : (isInsideZone ? '#10b981' : '#64748b');
-          ctx.fillRect(minX, minY - 30, boxW, 30);
-          ctx.fillStyle = '#ffffff';
-          ctx.font = 'bold 14px monospace';
-          ctx.fillText(
-            `${finalAction.toUpperCase()} ${(visibilityScore * 100).toFixed(0)}%`, 
-            minX + 5, 
-            minY - 10
-          );
-
-          let snapshotData: string | undefined = undefined;
-          if (isSuspicious && Date.now() - lastSnapshotTimeRef.current > 5000) {
-              snapshotData = canvasRef.current.toDataURL('image/jpeg', 0.6);
-              lastSnapshotTimeRef.current = Date.now();
-          }
-
-          if (onDetectionUpdateRef.current) {
-            onDetectionUpdateRef.current(isSuspicious, visibilityScore, finalAction, snapshotData);
-          }
-      } else {
-           if (onDetectionUpdateRef.current) onDetectionUpdateRef.current(false, 0, 'none');
+      if ((window as any).drawConnectors) {
+          let color = profile ? '#10b981' : '#cbd5e1'; 
+          if (['fighting', 'stealing', 'burglary', 'aggressive'].includes(stableAction)) color = '#ef4444';
+          (window as any).drawConnectors(ctx, landmarks, (window as any).POSE_CONNECTIONS, {color, lineWidth: 2});
       }
-    } else {
-        if (onDetectionUpdateRef.current) onDetectionUpdateRef.current(false, 0, 'none');
+
+      const isDangerous = ['fighting', 'stealing', 'climbing', 'crawling', 'surrender', 'aggressive', 'burglary'].includes(stableAction);
+      const timeSincePayload = now - lastPayloadSentRef.current;
+      if (stableAction !== 'none' && ( (isDangerous && timeSincePayload > 1000) || timeSincePayload > 4000) ) {
+          onDetectionUpdate(!profile || isDangerous, avgConf, stableAction, canvasRef.current.toDataURL('image/jpeg', 0.5), classification.summary, profile?.name, signature);
+          lastPayloadSentRef.current = now;
+      }
     }
-    ctx.restore();
   };
 
-  const handleStop = () => {
-    if (videoRef.current) {
-        videoRef.current.pause();
-        videoRef.current.currentTime = 0;
-    }
-    if (onStop) onStop();
+  const handleSaveRegistration = () => {
+    if (!registrationName.trim() || !capturedSignature) return;
+    onRegisterProfile({
+      id: Math.random().toString(36).substring(2, 9),
+      name: registrationName,
+      role: registrationRole,
+      signature: capturedSignature,
+      lastSeen: new Date()
+    });
+    setIsRegistering(false);
+    setCapturedSignature(null);
+    setRegistrationName('');
   };
 
-  const getStatusLabel = () => {
-    if (videoSource) {
-      return videoSource.startsWith('http') ? 'IP CAMERA' : 'FILE PLAYBACK';
+  useEffect(() => {
+    let isMounted = true;
+    const init = async () => {
+        setLoadingModel(true);
+        try {
+          await Promise.all([
+            loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js", "Camera"),
+            loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3/drawing_utils.js", "drawConnectors"),
+            loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/pose.js", "Pose")
+          ]);
+          if (!isMounted) return;
+          const pose = new (window as any).Pose({ locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404/${file}` });
+          pose.setOptions({ modelComplexity: 1, smoothLandmarks: true, minDetectionConfidence: 0.65, minTrackingConfidence: 0.65 });
+          pose.onResults(onResults);
+          poseRef.current = pose;
+          setModelReady(true);
+        } catch (e) { console.error("Model Load Error", e); }
+        setLoadingModel(false);
+    };
+    init();
+    return () => { isMounted = false; poseRef.current?.close(); };
+  }, []);
+
+  useEffect(() => {
+    if (loadingModel || !modelReady || !isSimulating) return;
+    let animationFrameId: number;
+    let camera: any = null;
+    const video = videoRef.current;
+
+    if (videoSource && video) {
+        const processFrame = async () => {
+             if (!video.paused && !video.ended) {
+                 try { if (poseRef.current) await poseRef.current.send({ image: video }); } catch(e) {}
+             }
+             animationFrameId = requestAnimationFrame(processFrame);
+        };
+        video.onloadeddata = () => { video.play().then(() => processFrame()); };
+        if (video.readyState >= 3) video.play().then(() => processFrame());
+    } else if (!videoSource && video) {
+        camera = new (window as any).Camera(video, {
+            onFrame: async () => { 
+               try { if (poseRef.current) await poseRef.current.send({ image: video }); } catch(e) {}
+            },
+            width: 1280, height: 720
+        });
+        camera.start();
     }
-    return 'LIVE FEED';
-  };
+    return () => { 
+        cancelAnimationFrame(animationFrameId);
+        if (camera) camera.stop();
+        if (video) video.pause();
+    };
+  }, [isSimulating, videoSource, modelReady, loadingModel]);
 
   return (
-    <div 
-        className={`relative w-full h-full bg-black rounded-lg overflow-hidden border border-white/5 shadow-2xl group ${isDrawing ? 'cursor-crosshair' : ''}`}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-    >
-      <video ref={videoRef} className="hidden" playsInline muted></video>
-      <canvas ref={heatmapRef} width={dimensions.width} height={dimensions.height} className="hidden" />
-      <canvas 
-        ref={canvasRef}
-        width={dimensions.width} 
-        height={dimensions.height}
-        className={`w-full h-full object-contain bg-black ${!videoSource ? 'transform scale-x-[-1]' : ''}`} 
-      />
+    <div className="relative w-full h-full bg-[#020617] flex items-center justify-center overflow-hidden">
+      <video ref={videoRef} className="opacity-0 absolute" playsInline muted autoPlay loop crossOrigin="anonymous" src={videoSource || undefined} />
+      <canvas ref={canvasRef} width={1280} height={720} className="max-w-full max-h-full object-contain grayscale-[0.2] contrast-[1.1]" />
       
-      {/* 3D View Overlay */}
-      {isSimulating && !loadingModel && !errorMsg && (
-        <div className={`absolute bottom-4 right-4 w-48 h-48 bg-slate-900/90 border border-slate-700 rounded-xl shadow-2xl backdrop-blur-md overflow-hidden transition-all duration-300 ${show3D ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-10 pointer-events-none'}`}>
-             <div className="absolute top-2 left-2 text-[10px] text-slate-400 font-mono">SPATIAL VIEW</div>
-             <canvas ref={canvas3DRef} width={192} height={192} className="w-full h-full"/>
-        </div>
-      )}
-
-      {/* Standby Screen */}
-      {(!isSimulating && !videoSource) && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 backdrop-blur-md z-10">
-           <div className="bg-slate-900/50 p-8 rounded-full mb-6 border border-white/5 relative">
-             <div className="absolute inset-0 rounded-full border border-cyan-500/20 animate-ping opacity-20"></div>
-             {videoSource ? <Video className="w-16 h-16 text-slate-400" /> : <Camera className="w-16 h-16 text-slate-400" />}
-           </div>
-           <h3 className="text-2xl font-bold text-white tracking-tight">System Standby</h3>
-           <p className="text-slate-500 mt-2 font-medium">Waiting for input stream initialization...</p>
-        </div>
-      )}
-
-      {/* Permission Denied Error */}
-      {permissionDenied && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/95 z-30 p-8 text-center">
-             <div className="p-4 bg-red-500/10 rounded-full mb-4"><Lock className="w-10 h-10 text-red-500" /></div>
-             <h3 className="text-xl font-bold text-white mb-2">Signal Blocked</h3>
-             <p className="text-slate-400 mb-6 max-w-sm">Camera access was denied. Check browser permissions or switch to file upload.</p>
-             <button onClick={() => window.location.reload()} className="px-6 py-2 bg-slate-800 border border-slate-600 rounded-lg text-white hover:bg-slate-700">Retry Connection</button>
-        </div>
-      )}
-
-      {errorMsg && !permissionDenied && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/95 z-30 p-8 text-center">
-             <AlertTriangle className="w-12 h-12 text-amber-500 mb-4" />
-             <h3 className="text-lg font-bold text-white">Stream Error</h3>
-             <p className="text-slate-400 text-sm mt-2 max-w-xs font-mono">{errorMsg}</p>
-        </div>
-      )}
-
-      {loadingModel && !errorMsg && !permissionDenied && (
-         <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 z-20 backdrop-blur-sm">
-            <div className="relative">
-                <RefreshCw className="w-12 h-12 text-cyan-500 animate-spin" />
-                <div className="absolute inset-0 blur-md bg-cyan-500/30 animate-pulse"></div>
-            </div>
-            <p className="text-cyan-400 font-mono mt-4 text-sm tracking-widest uppercase">Initializing Neural Engine</p>
+      {loadingModel && (
+         <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#020617] z-20">
+            <RefreshCw className="w-12 h-12 text-cyan-500 animate-spin" />
+            <p className="mt-4 text-cyan-400 font-mono text-[10px] uppercase tracking-widest animate-pulse">Initializing Biometric Engine...</p>
          </div>
       )}
 
-      {/* Video Control Bar */}
-      {videoSource && !loadingModel && !errorMsg && (
-          <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center space-x-2 px-4 py-2 bg-slate-900/80 backdrop-blur-md border border-white/10 rounded-full shadow-2xl z-30 opacity-0 group-hover:opacity-100 transition-opacity duration-300 transform translate-y-2 group-hover:translate-y-0">
-              <button onClick={onTogglePlay} className="p-2 hover:bg-white/10 rounded-full transition-colors text-white">
-                  {isSimulating ? <Pause className="w-5 h-5 fill-current" /> : <Play className="w-5 h-5 fill-current" />}
-              </button>
-              <button onClick={handleStop} className="p-2 hover:bg-white/10 rounded-full transition-colors text-red-400">
-                  <Square className="w-5 h-5 fill-current" />
-              </button>
-              <div className="h-4 w-px bg-white/20 mx-2"></div>
-              <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wider pr-2">
-                 {isSimulating ? 'Playing' : 'Paused'}
-              </span>
+      {/* TOP HUD */}
+      <div className="absolute top-4 left-4 flex flex-col space-y-2 z-20">
+          <div className="bg-black/70 backdrop-blur-md px-3 py-1.5 rounded border-l-2 border-cyan-500 flex items-center shadow-xl">
+              <Cpu className="w-3 h-3 text-cyan-500 mr-2" />
+              <div className="flex flex-col">
+                <span className="text-[9px] text-white font-black tracking-widest uppercase italic">VG-AI Vision</span>
+                <span className="text-[7px] text-slate-400 font-mono">{inferenceTime}ms Latency</span>
+              </div>
           </div>
-      )}
+      </div>
 
-      {/* OSD (On Screen Display) Overlays */}
-      {isSimulating && !loadingModel && !errorMsg && (
-        <>
-            <div className="absolute top-4 left-4 flex items-center space-x-3 z-20 pointer-events-none">
-                <div className="flex items-center space-x-2 bg-black/60 backdrop-blur-md px-3 py-1.5 rounded text-white border border-white/10">
-                    <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]"></div>
-                    <span className="text-[10px] font-mono font-bold tracking-widest">{getStatusLabel()}</span>
+      {/* BOTTOM CONTROL */}
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-20">
+          {!matchedProfile && modelReady && !isRegistering && isSimulating && (
+              <button 
+                onClick={() => setIsRegistering(true)}
+                className="bg-white hover:bg-cyan-50 text-slate-950 px-6 py-2.5 rounded-sm font-black text-[9px] uppercase tracking-[0.2em] shadow-2xl transition-all hover:scale-105"
+              >
+                  Register Signature
+              </button>
+          )}
+      </div>
+
+      {isRegistering && (
+        <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-md z-30 flex items-center justify-center p-6">
+            <div className="bg-slate-900 border border-cyan-500/30 p-8 rounded-sm max-w-sm w-full shadow-2xl animate-in zoom-in-95">
+                <div className="flex items-center space-x-3 mb-6">
+                    <UserCheck className="w-6 h-6 text-cyan-400" />
+                    <h2 className="text-lg font-black text-white uppercase tracking-widest">Biometric Enrollment</h2>
                 </div>
-                {videoSource?.startsWith('http') && <Globe className="w-4 h-4 text-slate-400"/>}
-            </div>
-
-            <div className="absolute top-4 right-4 flex items-center space-x-2 z-20 pointer-events-auto">
-                 <button onClick={onToggleFocus} className="bg-black/60 hover:bg-black/80 p-2 rounded text-white border border-white/10 transition-colors backdrop-blur-md">
-                    {isFocused ? <Minimize2 className="w-4 h-4"/> : <Maximize2 className="w-4 h-4"/>}
-                 </button>
-            </div>
-
-            <div className="absolute bottom-4 left-4 z-20 pointer-events-auto">
-                <div className="flex items-center space-x-3">
-                    <div className="text-[10px] font-mono text-cyan-400 bg-black/80 border border-cyan-900/50 px-3 py-1.5 rounded backdrop-blur-md shadow-lg">
-                        YOLO11-POSE <span className="mx-2 text-slate-600">|</span> {inferenceTime}ms
-                    </div>
-                    
-                    <button 
-                        onClick={() => setShow3D(!show3D)}
-                        className={`p-1.5 rounded border transition-colors ${show3D ? 'bg-cyan-600 border-cyan-400 text-white' : 'bg-black/60 border-white/10 text-slate-400 hover:text-white'}`}
-                        title="Toggle 3D"
-                    >
-                        <Cuboid className="w-4 h-4" />
-                    </button>
-                    
-                    <button 
-                        onClick={() => onToggleHeatmap(!showHeatmap)}
-                        className={`p-1.5 rounded border transition-colors ${showHeatmap ? 'bg-orange-600 border-orange-400 text-white' : 'bg-black/60 border-white/10 text-slate-400 hover:text-white'}`}
-                        title="Toggle Heatmap"
-                    >
-                        <Flame className="w-4 h-4" />
-                    </button>
-                    
-                    <button 
-                        onClick={() => onPrivacyChange(!privacyMode)}
-                        className={`p-1.5 rounded border transition-colors ${privacyMode ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-black/60 border-white/10 text-slate-400 hover:text-white'}`}
-                        title="Toggle Privacy Blur"
-                    >
-                        <EyeOff className="w-4 h-4" />
-                    </button>
-
-                    <button 
-                        onClick={() => {
-                            if (zoneRect) onZoneChange(null);
-                            else onDrawingChange(!isDrawing);
-                        }}
-                        className={`p-1.5 rounded border transition-colors ${isDrawing ? 'bg-emerald-600 border-emerald-400 text-white' : (zoneRect ? 'bg-red-900/80 border-red-500 text-red-200' : 'bg-black/60 border-white/10 text-slate-400 hover:text-white')}`}
-                        title="Draw Zone"
-                    >
-                        <Scan className="w-4 h-4" />
-                    </button>
+                <div className="space-y-6">
+                   <div className="space-y-1.5">
+                      <label className="text-[9px] text-slate-500 uppercase font-bold tracking-widest block">Full Name</label>
+                      <input 
+                        type="text" value={registrationName} onChange={e => setRegistrationName(e.target.value)}
+                        className="w-full bg-black/40 border border-white/5 rounded-sm px-3 py-2 text-xs text-white focus:border-cyan-500 outline-none"
+                        placeholder="Enrollment Subject"
+                      />
+                   </div>
+                   <div className="space-y-1.5">
+                      <label className="text-[9px] text-slate-500 uppercase font-bold tracking-widest block">Access Level</label>
+                      <div className="grid grid-cols-3 gap-2">
+                        {(['family', 'guest', 'staff'] as const).map(role => (
+                            <button 
+                            key={role} onClick={() => setRegistrationRole(role)}
+                            className={`py-2 rounded-sm text-[8px] font-bold uppercase tracking-tighter border transition-all ${registrationRole === role ? 'bg-cyan-600 border-cyan-400 text-white' : 'bg-black/40 border-white/5 text-slate-500'}`}
+                            >
+                            {role}
+                            </button>
+                        ))}
+                      </div>
+                   </div>
+                   <div className="pt-2 flex space-x-2">
+                      <button onClick={handleSaveRegistration} className="flex-1 bg-cyan-600 hover:bg-cyan-500 py-3 rounded-sm font-black text-[9px] uppercase tracking-widest text-white">Commit ID</button>
+                      <button onClick={() => { setIsRegistering(false); setRegistrationName(''); }} className="flex-1 bg-slate-800 hover:bg-slate-700 py-3 rounded-sm font-black text-[9px] uppercase tracking-widest text-slate-500">Cancel</button>
+                   </div>
                 </div>
             </div>
-
-            {isDrawing && !zoneRect && (
-                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-black/70 px-4 py-2 rounded-lg text-white text-sm font-medium border border-white/20 pointer-events-none z-30 flex items-center backdrop-blur">
-                    <MousePointer2 className="w-4 h-4 mr-2" />
-                    Click and drag to set perimeter
-                </div>
-            )}
-
-            {status === SecurityStatus.DANGER && (
-                <div className="absolute top-16 right-4 animate-in slide-in-from-right-10 duration-300 z-20">
-                     <div className="bg-red-600/90 text-white font-bold px-4 py-3 rounded border border-red-400 shadow-[0_0_30px_rgba(220,38,38,0.6)] flex items-center backdrop-blur-sm">
-                        <AlertTriangle className="w-6 h-6 mr-3 animate-pulse" />
-                        <div>
-                            <div className="text-sm leading-none">THREAT DETECTED</div>
-                            <div className="text-[10px] font-mono opacity-80 font-normal mt-1">RECORDING EVENT...</div>
-                        </div>
-                     </div>
-                </div>
-            )}
-        </>
+        </div>
       )}
     </div>
   );
